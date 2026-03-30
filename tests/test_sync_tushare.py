@@ -2,6 +2,8 @@
 """测试 sync_tushare.py 的速率控制逻辑"""
 import sys
 import os
+import tempfile
+import sqlite3
 
 # 添加src路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
@@ -43,6 +45,48 @@ def test_constants():
     print(f"✅ 常量配置正确: API_INTERVAL={API_INTERVAL}, RATE_LIMIT_WAIT={RATE_LIMIT_WAIT}")
     return True
 
+def test_get_existing_stocks_for_date():
+    """测试获取已存在股票逻辑"""
+    import sync_tushare
+    
+    # 创建临时数据库测试
+    with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+        db_path = f.name
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE stock_daily (
+                ts_code TEXT,
+                trade_date TEXT,
+                date TEXT,
+                close REAL
+            )
+        """)
+        # 插入测试数据
+        conn.execute("INSERT INTO stock_daily (ts_code, trade_date, date) VALUES ('000001.SH', '20260330', '20260330')")
+        conn.execute("INSERT INTO stock_daily (ts_code, trade_date, date) VALUES ('000002.SZ', '20260330', '20260330')")
+        conn.execute("INSERT INTO stock_daily (ts_code, trade_date, date) VALUES ('000003.SZ', '20260330', '20260330')")
+        conn.commit()
+        conn.close()
+        
+        # 临时替换DB_PATH
+        original_db_path = sync_tushare.DB_PATH
+        sync_tushare.DB_PATH = db_path
+        
+        result = sync_tushare.get_existing_stocks_for_date('20260330')
+        
+        sync_tushare.DB_PATH = original_db_path
+        
+        assert len(result) == 3, f"应返回3只股票，实际: {len(result)}"
+        assert '000001.SH' in result
+        assert '000002.SZ' in result
+        
+        print(f"✅ 增量同步逻辑测试通过: {len(result)} 只股票已存在")
+        return True
+    finally:
+        os.unlink(db_path)
+
 def main():
     print("=" * 50)
     print("sync_tushare.py 测试")
@@ -52,6 +96,7 @@ def main():
         ("模块导入", test_import),
         ("常量配置", test_constants),
         ("限速识别", test_rate_limit_detection),
+        ("增量同步", test_get_existing_stocks_for_date),
     ]
     
     results = []
@@ -61,6 +106,8 @@ def main():
             results.append((name, func()))
         except Exception as e:
             print(f"❌ 测试异常: {e}")
+            import traceback
+            traceback.print_exc()
             results.append((name, False))
     
     print("\n" + "=" * 50)

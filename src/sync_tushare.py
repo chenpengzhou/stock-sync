@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tushare数据同步脚本 v3.1
+Tushare数据同步脚本 v3.2
 - 补偿机制：自动补齐所有缺失的交易日
 - 数据就绪探测：Tushare 数据未就绪时等待重试
 - 交易日历驱动：使用 trade_cal API 而非硬编码周末
 - 指数数据支持：修复 pre_close 列问题
 - 速率控制：检测到限速后自动等待重试
+- 增量同步：对于已存在的交易日，只同步缺失的股票（重试失败）
 使用方法:
     python sync_tushare.py [token]
     或设置环境变量: TUSHARE_TOKEN
@@ -73,6 +74,20 @@ def get_db_last_date() -> str:
     except Exception as e:
         logger.error(f"获取数据库最后日期失败: {e}")
         return None
+
+
+def get_existing_stocks_for_date(trade_date: str) -> set:
+    """获取指定日期已存在的股票代码集合"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT ts_code FROM stock_daily WHERE date=?", (trade_date,))
+        existing = set(row[0] for row in cur.fetchall())
+        conn.close()
+        return existing
+    except Exception as e:
+        logger.error(f"获取已有股票列表失败: {e}")
+        return set()
 
 
 def get_trade_days(pro, from_date: str, to_date: str) -> list:
@@ -153,8 +168,10 @@ def insert_replace_daily(conn, df):
         ))
 
 
-def sync_stock_daily(pro, trade_date: str) -> tuple:
-    """同步股票日线数据（单日），带速率控制和限速重试"""
+def sync_stock_daily(pro, trade_date: str, existing_stocks: set = None) -> tuple:
+    """同步股票日线数据（单日），带速率控制和限速重试
+    - existing_stocks: 该日期已存在的股票集合，用于增量同步
+    """
     try:
         # 获取A股所有股票
         df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name,area,industry,list_date')
@@ -163,13 +180,22 @@ def sync_stock_daily(pro, trade_date: str) -> tuple:
         synced = 0
         failed = 0
         no_data = 0
+        skipped = 0
         rate_limit_hits = 0
         
         total = len(df)
         logger.info(f"[{trade_date}] 开始同步 {total} 只股票...")
         
+        if existing_stocks:
+            logger.info(f"[{trade_date}] 增量模式: 已存在 {len(existing_stocks)} 只股票，将跳过")
+        
         for i, row in df.iterrows():
             ts_code = row['ts_code']
+            
+            # 增量同步：跳过已存在的股票
+            if existing_stocks and ts_code in existing_stocks:
+                skipped += 1
+                continue
             
             # 限速重试机制
             max_retries = 3
@@ -185,7 +211,7 @@ def sync_stock_daily(pro, trade_date: str) -> tuple:
                         conn.close()
                         synced += 1
                         if synced % 500 == 0:
-                            logger.info(f"[{trade_date}] 进度: {synced}/{total}")
+                            logger.info(f"[{trade_date}] 进度: {synced}/{total}, 已跳过: {skipped}")
                     else:
                         no_data += 1
                     break  # 成功或无数据，跳出重试循环
@@ -207,7 +233,7 @@ def sync_stock_daily(pro, trade_date: str) -> tuple:
                 if failed <= 5:
                     logger.error(f"同步失败（重试耗尽）: {ts_code}")
         
-        logger.info(f"[{trade_date}] 股票同步完成: 成功 {synced}, 失败 {failed}, 无数据 {no_data}, 限速中断 {rate_limit_hits} 次")
+        logger.info(f"[{trade_date}] 股票同步完成: 成功 {synced}, 失败 {failed}, 无数据 {no_data}, 跳过(已存在) {skipped}, 限速中断 {rate_limit_hits} 次")
         return synced, failed
         
     except Exception as e:
@@ -253,7 +279,7 @@ def sync_index_daily(pro, trade_date: str):
 
 
 def sync_all_missing_days(pro):
-    """补偿机制：同步所有缺失的交易日"""
+    """补偿机制：同步所有缺失的交易日（增量同步+重试失败）"""
     last_date = get_db_last_date()
     if not last_date:
         logger.error("无法获取数据库最后日期")
@@ -279,13 +305,18 @@ def sync_all_missing_days(pro):
     for date in trade_days:
         logger.info(f"========== 开始同步 {date} ==========")
         
+        # 获取该日已存在的股票（用于增量同步）
+        existing_stocks = get_existing_stocks_for_date(date)
+        
         # 数据就绪探测
         if not wait_for_data_ready(pro, date):
             logger.warning(f"[{date}] 数据未就绪，跳过股票同步")
             # 仍然尝试同步指数（指数通常更快就绪）
+            sync_index_daily(pro, date)
+            continue
         
-        # 同步股票
-        sync_stock_daily(pro, date)
+        # 同步股票（传入已存在的股票集合，只同步缺失的）
+        sync_stock_daily(pro, date, existing_stocks)
         
         # 同步指数
         sync_index_daily(pro, date)
@@ -315,13 +346,13 @@ def main():
         print("  或设置环境变量: export TUSHARE_TOKEN=your_token")
         sys.exit(1)
     
-    logger.info(f"========== Tushare 数据同步 v3.1 ==========")
+    logger.info(f"========== Tushare 数据同步 v3.2 ==========")
     
     pro = get_tushare(token)
     if not pro:
         sys.exit(1)
     
-    # 补偿机制：自动同步所有缺失日期
+    # 补偿机制：自动同步所有缺失日期（增量同步+重试失败）
     sync_all_missing_days(pro)
     
     # 最终状态
