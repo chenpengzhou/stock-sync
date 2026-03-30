@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tushare数据同步脚本 v3.3
+Tushare数据同步脚本 v3.4
 - 补偿机制：自动补齐所有缺失的交易日
 - 数据就绪探测：Tushare 数据未就绪时等待重试
 - 交易日历驱动：使用 trade_cal API 而非硬编码周末
@@ -308,31 +308,29 @@ def sync_all_missing_days(pro):
     today = datetime.now().strftime('%Y%m%d')
     logger.info(f"数据库最后日期: {last_date}，今天: {today}")
     
-    # 获取从 last_date 的下一交易日起到今天的所有交易日
-    next_day = get_next_trade_day(pro, last_date)
-    if not next_day:
-        logger.warning("无法获取下一交易日")
-        return
-    
-    trade_days = get_trade_days(pro, next_day, today)
+    # 获取从 last_date 到 today 的所有交易日
+    trade_days = get_trade_days(pro, last_date, today)
     
     if not trade_days:
-        logger.info("没有需要同步的日期（检查是否需要补全已存在但数量不足的日期）")
+        logger.info("没有需要同步的交易日")
+        # 但仍检查最后日期是否需要补全
+        existing_count = get_existing_count_for_date(last_date)
+        if existing_count < EXPECTED_STOCK_COUNT * 0.5:
+            logger.info(f"[{last_date}] 数据不完整 ({existing_count} 只)，需要增量同步")
+            existing_stocks = get_existing_stocks_for_date(last_date)
+            if wait_for_data_ready(pro, last_date):
+                sync_stock_daily(pro, last_date, existing_stocks)
+                sync_index_daily(pro, last_date)
+        return
     
-    # 对于每个需要检查的日期（从last_date到today）
-    all_dates_to_check = trade_days
+    logger.info(f"需要同步/检查的交易日: {trade_days}")
     
-    # 特别处理：也检查今天是否需要补全（即使"最后日期"就是今天）
-    if last_date != today:
-        all_dates_to_check = get_trade_days(pro, last_date, today)
-    
-    for date in all_dates_to_check:
+    for date in trade_days:
         existing_count = get_existing_count_for_date(date)
         
         if existing_count == 0:
             # 日期完全不存在，需要全量同步
             logger.info(f"========== 开始全量同步 {date} ==========")
-            logger.info(f"[{date}] 日期不存在，需要全量同步")
             
             if not wait_for_data_ready(pro, date):
                 logger.warning(f"[{date}] 数据未就绪，跳过股票同步")
@@ -386,7 +384,7 @@ def main():
         print("  或设置环境变量: export TUSHARE_TOKEN=your_token")
         sys.exit(1)
     
-    logger.info(f"========== Tushare 数据同步 v3.3 ==========")
+    logger.info(f"========== Tushare 数据同步 v3.4 ==========")
     
     pro = get_tushare(token)
     if not pro:
