@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tushare财务数据同步脚本 v1.0
-- 同步内容：利润表、资产负债表、现金流量表、财务指标
-- 使用批量接口：每类型数据一次API调用获取所有股票
-- 增量同步：只同步最新一期的财务数据
+Tushare财务数据同步脚本 v1.1
+- 同步内容：财务指标、利润表、资产负债表、现金流量表
+- 分批并行：获取所有股票列表后分批并行请求
+- 增量同步：按end_date去重
 使用方法:
     python sync_financial.py [token]
     或设置环境变量: TUSHARE_TOKEN
@@ -15,6 +15,7 @@ import time
 import sqlite3
 import logging
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 配置日志
 LOG_DIR = os.path.expanduser("~/.openclaw/logs")
@@ -32,6 +33,10 @@ logger = logging.getLogger(__name__)
 
 # 数据库路径
 DB_PATH = os.path.expanduser("~/.openclaw/data/stock.db")
+
+# 并行线程数（避免触发限速）
+MAX_WORKERS = 8
+API_INTERVAL = 0.1  # 每次API调用间隔
 
 
 def get_tushare(token: str):
@@ -60,25 +65,14 @@ def ensure_tables(conn):
             diluted_eps REAL,
             total_revenue REAL,
             revenue REAL,
-            fin_revenue REAL,
-            operate_income REAL,
-            invest_income REAL,
-            operate_profit REAL,
-            total_profit REAL,
             net_profit REAL,
             total_assets REAL,
             total_liabilities REAL,
-            total_holders_equity REAL,
             equity_parent_tot REAL,
             roe REAL,
-            roe加权 REAL,
             roa REAL,
-            debts_to_assets REAL,
-            ar_turn REAL,
-            assets_turn REAL,
             gross_profit_rate REAL,
             net_profit_rate REAL,
-            debt_to_assets REAL,
             PRIMARY KEY (ts_code, end_date)
         )
     """)
@@ -96,9 +90,6 @@ def ensure_tables(conn):
             net_profit REAL,
             net_profit_attr_e REAL,
             basic_eps REAL,
-            diluted_eps REAL,
-            total_revenue_yoy REAL,
-            net_profit_yoy REAL,
             PRIMARY KEY (ts_code, end_date)
         )
     """)
@@ -114,8 +105,6 @@ def ensure_tables(conn):
             total_equity REAL,
             equity_parent REAL,
             curr_assets REAL,
-            non_curr_assets REAL,
-            total_liab_2 REAL,
             PRIMARY KEY (ts_code, end_date)
         )
     """)
@@ -136,190 +125,142 @@ def ensure_tables(conn):
     conn.commit()
 
 
-def get_latest_financial_date(conn, table: str) -> str:
-    """获取某张财务表的最新日期"""
+def get_all_stock_codes(pro) -> list:
+    """获取所有股票代码"""
     try:
-        cur = conn.cursor()
-        cur.execute(f"SELECT MAX(end_date) FROM {table}")
-        result = cur.fetchone()[0]
-        return result if result else None
-    except:
-        return None
-
-
-def sync_financial_indicators(pro, ann_date: str = None) -> int:
-    """同步财务指标数据"""
-    try:
-        if ann_date:
-            df = pro.fina_indicator(ann_date=ann_date)
-        else:
-            df = pro.fina_indicator()
-        
-        if df is None or df.empty:
-            logger.warning("财务指标数据为空")
-            return 0
-        
-        conn = sqlite3.connect(DB_PATH)
-        ensure_tables(conn)
-        
-        synced = 0
-        for _, row in df.iterrows():
-            try:
-                conn.execute("""
-                    INSERT OR REPLACE INTO financial_indicators
-                    (ts_code, ann_date, end_date, basic_eps, diluted_eps, total_revenue, revenue,
-                     fin_revenue, operate_income, invest_income, operate_profit, total_profit,
-                     net_profit, total_assets, total_liabilities, total_holders_equity,
-                     equity_parent_tot, roe, roe加权, roa, debts_to_assets, ar_turn,
-                     assets_turn, gross_profit_rate, net_profit_rate, debt_to_assets)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    row.get('ts_code'), row.get('ann_date'), row.get('end_date'),
-                    row.get('basic_eps'), row.get('diluted_eps'), row.get('total_revenue'),
-                    row.get('revenue'), row.get('fin_revenue'), row.get('operate_income'),
-                    row.get('invest_income'), row.get('operate_profit'), row.get('total_profit'),
-                    row.get('net_profit'), row.get('total_assets'), row.get('total_liabilities'),
-                    row.get('total_holders_equity'), row.get('equity_parent_tot'),
-                    row.get('roe'), row.get('roe加权'), row.get('roa'), row.get('debts_to_assets'),
-                    row.get('ar_turn'), row.get('assets_turn'), row.get('gross_profit_rate'),
-                    row.get('net_profit_rate'), row.get('debt_to_assets')
-                ))
-                synced += 1
-            except Exception as e:
-                pass
-        
-        conn.commit()
-        conn.close()
-        logger.info(f"财务指标同步完成: {synced} 条")
-        return synced
+        df = pro.stock_basic(exchange='', list_status='L', fields='ts_code')
+        return df['ts_code'].tolist() if df is not None else []
     except Exception as e:
-        logger.error(f"财务指标同步失败: {e}")
-        return 0
+        logger.error(f"获取股票列表失败: {e}")
+        return []
 
 
-def sync_income_statement(pro, ann_date: str = None) -> int:
-    """同步利润表数据"""
+def sync_single_stock_financial(pro, ts_code: str, fields: dict) -> int:
+    """同步单支股票的财务数据（所有类型）"""
+    synced = 0
     try:
-        if ann_date:
-            df = pro.income(ann_date=ann_date)
-        else:
-            df = pro.income()
-        
-        if df is None or df.empty:
-            logger.warning("利润表数据为空")
-            return 0
-        
-        conn = sqlite3.connect(DB_PATH)
-        ensure_tables(conn)
-        
-        synced = 0
-        for _, row in df.iterrows():
-            try:
-                conn.execute("""
-                    INSERT OR REPLACE INTO income_statement
-                    (ts_code, ann_date, end_date, total_revenue, revenue, oper_cost,
-                     total_profit, net_profit, net_profit_attr_e, basic_eps, diluted_eps,
-                     total_revenue_yoy, net_profit_yoy)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    row.get('ts_code'), row.get('ann_date'), row.get('end_date'),
-                    row.get('total_revenue'), row.get('revenue'), row.get('oper_cost'),
-                    row.get('total_profit'), row.get('net_profit'), row.get('net_profit_attr_e'),
-                    row.get('basic_eps'), row.get('diluted_eps'),
-                    row.get('total_revenue_yoy'), row.get('net_profit_yoy')
-                ))
+        # 财务指标（最新一期）
+        try:
+            df = pro.fina_indicator(ts_code=ts_code)
+            time.sleep(API_INTERVAL)
+            if df is not None and not df.empty:
+                conn = sqlite3.connect(DB_PATH)
+                for _, row in df.head(1).iterrows():
+                    conn.execute("""
+                        INSERT OR REPLACE INTO financial_indicators
+                        (ts_code, ann_date, end_date, basic_eps, diluted_eps, total_revenue, revenue,
+                         net_profit, total_assets, total_liabilities, equity_parent_tot, roe, roa,
+                         gross_profit_rate, net_profit_rate)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        row.get('ts_code'), row.get('ann_date'), row.get('end_date'),
+                        row.get('eps'), row.get('dt_eps'), row.get('total_revenue'),
+                        row.get('revenue'), row.get('net_profit'), row.get('total_assets'),
+                        row.get('total_liabilities'), row.get('equity_parent_tot'),
+                        row.get('roe'), row.get('roa'),
+                        row.get('gross_profit_rate'), row.get('net_profit_rate')
+                    ))
+                conn.commit()
+                conn.close()
                 synced += 1
-            except Exception as e:
-                pass
+        except Exception as e:
+            pass
         
-        conn.commit()
-        conn.close()
-        logger.info(f"利润表同步完成: {synced} 条")
-        return synced
-    except Exception as e:
-        logger.error(f"利润表同步失败: {e}")
-        return 0
-
-
-def sync_balance_sheet(pro, ann_date: str = None) -> int:
-    """同步资产负债表数据"""
-    try:
-        if ann_date:
-            df = pro.balancesheet(ann_date=ann_date)
-        else:
-            df = pro.balancesheet()
-        
-        if df is None or df.empty:
-            logger.warning("资产负债表数据为空")
-            return 0
-        
-        conn = sqlite3.connect(DB_PATH)
-        ensure_tables(conn)
-        
-        synced = 0
-        for _, row in df.iterrows():
-            try:
-                conn.execute("""
-                    INSERT OR REPLACE INTO balance_sheet
-                    (ts_code, ann_date, end_date, total_assets, total_liabilities,
-                     total_equity, equity_parent, curr_assets, non_curr_assets, total_liab_2)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    row.get('ts_code'), row.get('ann_date'), row.get('end_date'),
-                    row.get('total_assets'), row.get('total_liabilities'),
-                    row.get('total_equity'), row.get('equity_parent'),
-                    row.get('curr_assets'), row.get('non_curr_assets'), row.get('total_liab_2')
-                ))
+        # 利润表（最新一期）
+        try:
+            df = pro.income(ts_code=ts_code)
+            time.sleep(API_INTERVAL)
+            if df is not None and not df.empty:
+                conn = sqlite3.connect(DB_PATH)
+                for _, row in df.head(1).iterrows():
+                    conn.execute("""
+                        INSERT OR REPLACE INTO income_statement
+                        (ts_code, ann_date, end_date, total_revenue, revenue, oper_cost,
+                         total_profit, net_profit, net_profit_attr_e, basic_eps)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        row.get('ts_code'), row.get('ann_date'), row.get('end_date'),
+                        row.get('total_revenue'), row.get('revenue'), row.get('oper_cost'),
+                        row.get('total_profit'), row.get('net_profit'), row.get('net_profit_attr_e'),
+                        row.get('eps')
+                    ))
+                conn.commit()
+                conn.close()
                 synced += 1
-            except Exception as e:
-                pass
+        except Exception as e:
+            pass
         
-        conn.commit()
-        conn.close()
-        logger.info(f"资产负债表同步完成: {synced} 条")
-        return synced
-    except Exception as e:
-        logger.error(f"资产负债表同步失败: {e}")
-        return 0
-
-
-def sync_cashflow(pro, ann_date: str = None) -> int:
-    """同步现金流量表数据"""
-    try:
-        if ann_date:
-            df = pro.cashflow(ann_date=ann_date)
-        else:
-            df = pro.cashflow()
-        
-        if df is None or df.empty:
-            logger.warning("现金流量表数据为空")
-            return 0
-        
-        conn = sqlite3.connect(DB_PATH)
-        ensure_tables(conn)
-        
-        synced = 0
-        for _, row in df.iterrows():
-            try:
-                conn.execute("""
-                    INSERT OR REPLACE INTO cashflow
-                    (ts_code, ann_date, end_date, net_cash_flow, net_cash_flow_2, net_cash_flow_3)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (
-                    row.get('ts_code'), row.get('ann_date'), row.get('end_date'),
-                    row.get('net_cash_flow'), row.get('net_cash_flow_2'), row.get('net_cash_flow_3')
-                ))
+        # 资产负债表（最新一期）
+        try:
+            df = pro.balancesheet(ts_code=ts_code)
+            time.sleep(API_INTERVAL)
+            if df is not None and not df.empty:
+                conn = sqlite3.connect(DB_PATH)
+                for _, row in df.head(1).iterrows():
+                    conn.execute("""
+                        INSERT OR REPLACE INTO balance_sheet
+                        (ts_code, ann_date, end_date, total_assets, total_liabilities,
+                         total_equity, equity_parent, curr_assets)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        row.get('ts_code'), row.get('ann_date'), row.get('end_date'),
+                        row.get('total_assets'), row.get('total_liabilities'),
+                        row.get('total_equity'), row.get('equity_parent'),
+                        row.get('curr_assets')
+                    ))
+                conn.commit()
+                conn.close()
                 synced += 1
-            except Exception as e:
-                pass
+        except Exception as e:
+            pass
         
-        conn.commit()
-        conn.close()
-        logger.info(f"现金流量表同步完成: {synced} 条")
-        return synced
+        # 现金流量表（最新一期）
+        try:
+            df = pro.cashflow(ts_code=ts_code)
+            time.sleep(API_INTERVAL)
+            if df is not None and not df.empty:
+                conn = sqlite3.connect(DB_PATH)
+                for _, row in df.head(1).iterrows():
+                    conn.execute("""
+                        INSERT OR REPLACE INTO cashflow
+                        (ts_code, ann_date, end_date, net_cash_flow, net_cash_flow_2, net_cash_flow_3)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (
+                        row.get('ts_code'), row.get('ann_date'), row.get('end_date'),
+                        row.get('net_cash_flow'), row.get('net_cash_flow_2'), row.get('net_cash_flow_3')
+                    ))
+                conn.commit()
+                conn.close()
+                synced += 1
+        except Exception as e:
+            pass
+        
     except Exception as e:
-        logger.error(f"现金流量表同步失败: {e}")
-        return 0
+        pass
+    
+    return synced
+
+
+def sync_all_stocks_financial(pro, stock_codes: list) -> int:
+    """并行同步所有股票的财务数据"""
+    total_synced = 0
+    total = len(stock_codes)
+    
+    logger.info(f"开始并行同步 {total} 支股票的财务数据...")
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(sync_single_stock_financial, pro, code, {}): code 
+                   for code in stock_codes}
+        
+        completed = 0
+        for future in as_completed(futures):
+            completed += 1
+            result = future.result()
+            total_synced += result
+            if completed % 500 == 0:
+                logger.info(f"进度: {completed}/{total}")
+    
+    return total_synced
 
 
 def main():
@@ -333,19 +274,29 @@ def main():
         print("  或设置环境变量: export TUSHARE_TOKEN=your_token")
         sys.exit(1)
     
-    logger.info(f"========== Tushare 财务数据同步 v1.0 ==========")
+    logger.info(f"========== Tushare 财务数据同步 v1.1 ==========")
     
     pro = get_tushare(token)
     if not pro:
         sys.exit(1)
     
-    total = 0
-    total += sync_financial_indicators(pro)
-    total += sync_income_statement(pro)
-    total += sync_balance_sheet(pro)
-    total += sync_cashflow(pro)
+    # 获取所有股票列表
+    stock_codes = get_all_stock_codes(pro)
+    logger.info(f"获取到 {len(stock_codes)} 支股票")
     
-    logger.info(f"========== 财务数据同步完成，总计: {total} 条 ==========")
+    if not stock_codes:
+        logger.error("无法获取股票列表")
+        sys.exit(1)
+    
+    # 确保表存在
+    conn = sqlite3.connect(DB_PATH)
+    ensure_tables(conn)
+    conn.close()
+    
+    # 同步财务数据
+    total = sync_all_stocks_financial(pro, stock_codes)
+    
+    logger.info(f"========== 财务数据同步完成，覆盖股票数: {total} ==========")
 
 
 if __name__ == '__main__':
