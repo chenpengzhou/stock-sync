@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tushare数据同步脚本 v3.2
+Tushare数据同步脚本 v3.3
 - 补偿机制：自动补齐所有缺失的交易日
 - 数据就绪探测：Tushare 数据未就绪时等待重试
 - 交易日历驱动：使用 trade_cal API 而非硬编码周末
 - 指数数据支持：修复 pre_close 列问题
 - 速率控制：检测到限速后自动等待重试
-- 增量同步：对于已存在的交易日，只同步缺失的股票（重试失败）
+- 增量同步+完整性检查：
+  1. 对于缺失的日期：同步全部股票
+  2. 对于已存在但数量不足的日期：增量同步缺失的股票
 使用方法:
     python sync_tushare.py [token]
     或设置环境变量: TUSHARE_TOKEN
@@ -42,6 +44,9 @@ RATE_LIMIT_WAIT = 65  # 触发限速后等待秒数（略大于1分钟）
 
 # 限速错误关键字
 RATE_LIMIT_ERROR_KEYWORDS = ['每分钟最多访问', '500次', 'rate limit']
+
+# A股股票总数（估算，用于判断是否需要增量同步）
+EXPECTED_STOCK_COUNT = 5500
 
 
 def is_rate_limit_error(e: Exception) -> bool:
@@ -88,6 +93,20 @@ def get_existing_stocks_for_date(trade_date: str) -> set:
     except Exception as e:
         logger.error(f"获取已有股票列表失败: {e}")
         return set()
+
+
+def get_existing_count_for_date(trade_date: str) -> int:
+    """获取指定日期已存在的股票数量"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM stock_daily WHERE date=?", (trade_date,))
+        count = cur.fetchone()[0]
+        conn.close()
+        return count
+    except Exception as e:
+        logger.error(f"获取已有股票数量失败: {e}")
+        return 0
 
 
 def get_trade_days(pro, from_date: str, to_date: str) -> list:
@@ -170,7 +189,7 @@ def insert_replace_daily(conn, df):
 
 def sync_stock_daily(pro, trade_date: str, existing_stocks: set = None) -> tuple:
     """同步股票日线数据（单日），带速率控制和限速重试
-    - existing_stocks: 该日期已存在的股票集合，用于增量同步
+    - existing_stocks: 该日期已存在的股票集合，为None时表示全量同步
     """
     try:
         # 获取A股所有股票
@@ -184,10 +203,11 @@ def sync_stock_daily(pro, trade_date: str, existing_stocks: set = None) -> tuple
         rate_limit_hits = 0
         
         total = len(df)
-        logger.info(f"[{trade_date}] 开始同步 {total} 只股票...")
+        is_incremental = existing_stocks is not None
+        logger.info(f"[{trade_date}] 开始同步 {total} 只股票... ({'增量' if is_incremental else '全量'})")
         
-        if existing_stocks:
-            logger.info(f"[{trade_date}] 增量模式: 已存在 {len(existing_stocks)} 只股票，将跳过")
+        if is_incremental:
+            logger.info(f"[{trade_date}] 增量模式: 已存在 {len(existing_stocks)} 只股票，将只同步缺失的")
         
         for i, row in df.iterrows():
             ts_code = row['ts_code']
@@ -279,7 +299,7 @@ def sync_index_daily(pro, trade_date: str):
 
 
 def sync_all_missing_days(pro):
-    """补偿机制：同步所有缺失的交易日（增量同步+重试失败）"""
+    """同步所有缺失的交易日，并检查已存在日期的完整性"""
     last_date = get_db_last_date()
     if not last_date:
         logger.error("无法获取数据库最后日期")
@@ -297,29 +317,49 @@ def sync_all_missing_days(pro):
     trade_days = get_trade_days(pro, next_day, today)
     
     if not trade_days:
-        logger.info("没有需要同步的日期（可能今天不是交易日或数据已完整）")
-        return
+        logger.info("没有需要同步的日期（检查是否需要补全已存在但数量不足的日期）")
     
-    logger.info(f"需要同步的交易日: {trade_days}")
+    # 对于每个需要检查的日期（从last_date到today）
+    all_dates_to_check = trade_days
     
-    for date in trade_days:
-        logger.info(f"========== 开始同步 {date} ==========")
+    # 特别处理：也检查今天是否需要补全（即使"最后日期"就是今天）
+    if last_date != today:
+        all_dates_to_check = get_trade_days(pro, last_date, today)
+    
+    for date in all_dates_to_check:
+        existing_count = get_existing_count_for_date(date)
         
-        # 获取该日已存在的股票（用于增量同步）
-        existing_stocks = get_existing_stocks_for_date(date)
-        
-        # 数据就绪探测
-        if not wait_for_data_ready(pro, date):
-            logger.warning(f"[{date}] 数据未就绪，跳过股票同步")
-            # 仍然尝试同步指数（指数通常更快就绪）
+        if existing_count == 0:
+            # 日期完全不存在，需要全量同步
+            logger.info(f"========== 开始全量同步 {date} ==========")
+            logger.info(f"[{date}] 日期不存在，需要全量同步")
+            
+            if not wait_for_data_ready(pro, date):
+                logger.warning(f"[{date}] 数据未就绪，跳过股票同步")
+                sync_index_daily(pro, date)
+                continue
+            
+            sync_stock_daily(pro, date, None)  # 全量
             sync_index_daily(pro, date)
+            
+        elif existing_count < EXPECTED_STOCK_COUNT * 0.5:
+            # 日期存在但数量明显不足，需要增量同步
+            logger.info(f"========== 开始增量同步 {date} ==========")
+            logger.info(f"[{date}] 数据不完整 ({existing_count} 只)，需要增量同步")
+            
+            existing_stocks = get_existing_stocks_for_date(date)
+            
+            if not wait_for_data_ready(pro, date):
+                logger.warning(f"[{date}] 数据未就绪，跳过股票同步")
+                sync_index_daily(pro, date)
+                continue
+            
+            sync_stock_daily(pro, date, existing_stocks)  # 增量
+            sync_index_daily(pro, date)
+            
+        else:
+            logger.info(f"[{date}] 数据完整 ({existing_count} 只)，跳过")
             continue
-        
-        # 同步股票（传入已存在的股票集合，只同步缺失的）
-        sync_stock_daily(pro, date, existing_stocks)
-        
-        # 同步指数
-        sync_index_daily(pro, date)
         
         # 验证当日记录数
         try:
@@ -346,13 +386,13 @@ def main():
         print("  或设置环境变量: export TUSHARE_TOKEN=your_token")
         sys.exit(1)
     
-    logger.info(f"========== Tushare 数据同步 v3.2 ==========")
+    logger.info(f"========== Tushare 数据同步 v3.3 ==========")
     
     pro = get_tushare(token)
     if not pro:
         sys.exit(1)
     
-    # 补偿机制：自动同步所有缺失日期（增量同步+重试失败）
+    # 同步所有缺失的日期，并检查已存在日期的完整性
     sync_all_missing_days(pro)
     
     # 最终状态
